@@ -34,7 +34,6 @@ import (
 	"time"
 
 	"go4.org/mem"
-	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 	"inet.af/netaddr"
@@ -52,7 +51,7 @@ var debug, _ = strconv.ParseBool(os.Getenv("DERP_DEBUG_LOGS"))
 
 // verboseDropKeys is the set of destination public keys that should
 // verbosely log whenever DERP drops a packet.
-var verboseDropKeys = map[key.Public]bool{}
+var verboseDropKeys = map[key.NodePublic]bool{}
 
 func init() {
 	keys := os.Getenv("TS_DEBUG_VERBOSE_DROPS")
@@ -60,7 +59,7 @@ func init() {
 		return
 	}
 	for _, keyStr := range strings.Split(keys, ",") {
-		k, err := key.NewPublicFromHexMem(mem.S(keyStr))
+		k, err := key.ParseNodePublicUntyped(mem.S(keyStr))
 		if err != nil {
 			log.Printf("ignoring invalid debug key %q: %v", keyStr, err)
 		} else {
@@ -99,8 +98,8 @@ type Server struct {
 	// before failing when writing to a client.
 	WriteTimeout time.Duration
 
-	privateKey  key.Private
-	publicKey   key.Public
+	privateKey  key.NodePrivate
+	publicKey   key.NodePublic
 	logf        logger.Logf
 	memSys0     uint64 // runtime.MemStats.Sys at start (or early-ish)
 	meshKey     string
@@ -146,22 +145,22 @@ type Server struct {
 	mu       sync.Mutex
 	closed   bool
 	netConns map[Conn]chan struct{} // chan is closed when conn closes
-	clients  map[key.Public]clientSet
+	clients  map[key.NodePublic]clientSet
 	watchers map[*sclient]bool // mesh peer -> true
 	// clientsMesh tracks all clients in the cluster, both locally
 	// and to mesh peers.  If the value is nil, that means the
 	// peer is only local (and thus in the clients Map, but not
 	// remote). If the value is non-nil, it's remote (+ maybe also
 	// local).
-	clientsMesh map[key.Public]PacketForwarder
+	clientsMesh map[key.NodePublic]PacketForwarder
 	// sentTo tracks which peers have sent to which other peers,
 	// and at which connection number. This isn't on sclient
 	// because it includes intra-region forwarded packets as the
 	// src.
-	sentTo map[key.Public]map[key.Public]int64 // src => dst => dst's latest sclient.connNum
+	sentTo map[key.NodePublic]map[key.NodePublic]int64 // src => dst => dst's latest sclient.connNum
 
 	// maps from netaddr.IPPort to a client's public key
-	keyOfAddr map[netaddr.IPPort]key.Public
+	keyOfAddr map[netaddr.IPPort]key.NodePublic
 }
 
 // clientSet represents 1 or more *sclients.
@@ -277,7 +276,7 @@ func (s *dupClientSet) removeClient(c *sclient) bool {
 // is a multiForwarder, which this package creates as needed if a
 // public key gets more than one PacketForwarder registered for it.
 type PacketForwarder interface {
-	ForwardPacket(src, dst key.Public, payload []byte) error
+	ForwardPacket(src, dst key.NodePublic, payload []byte) error
 }
 
 // Conn is the subset of the underlying net.Conn the DERP Server needs.
@@ -294,7 +293,7 @@ type Conn interface {
 
 // NewServer returns a new DERP server. It doesn't listen on its own.
 // Connections are given to it via Server.Accept.
-func NewServer(privateKey key.Private, logf logger.Logf) *Server {
+func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
@@ -306,14 +305,14 @@ func NewServer(privateKey key.Private, logf logger.Logf) *Server {
 		packetsRecvByKind:    metrics.LabelMap{Label: "kind"},
 		packetsDroppedReason: metrics.LabelMap{Label: "reason"},
 		packetsDroppedType:   metrics.LabelMap{Label: "type"},
-		clients:              map[key.Public]clientSet{},
-		clientsMesh:          map[key.Public]PacketForwarder{},
+		clients:              map[key.NodePublic]clientSet{},
+		clientsMesh:          map[key.NodePublic]PacketForwarder{},
 		netConns:             map[Conn]chan struct{}{},
 		memSys0:              ms.Sys,
 		watchers:             map[*sclient]bool{},
-		sentTo:               map[key.Public]map[key.Public]int64{},
+		sentTo:               map[key.NodePublic]map[key.NodePublic]int64{},
 		avgQueueDuration:     new(uint64),
-		keyOfAddr:            map[netaddr.IPPort]key.Public{},
+		keyOfAddr:            map[netaddr.IPPort]key.NodePublic{},
 	}
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get("disco")
@@ -353,10 +352,10 @@ func (s *Server) HasMeshKey() bool { return s.meshKey != "" }
 func (s *Server) MeshKey() string { return s.meshKey }
 
 // PrivateKey returns the server's private key.
-func (s *Server) PrivateKey() key.Private { return s.privateKey }
+func (s *Server) PrivateKey() key.NodePrivate { return s.privateKey }
 
 // PublicKey returns the server's public key.
-func (s *Server) PublicKey() key.Public { return s.publicKey }
+func (s *Server) PublicKey() key.NodePublic { return s.publicKey }
 
 // Close closes the server and waits for the connections to disconnect.
 func (s *Server) Close() error {
@@ -447,7 +446,7 @@ func (s *Server) initMetacert() {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(ProtocolVersion),
 		Subject: pkix.Name{
-			CommonName: fmt.Sprintf("derpkey%x", s.publicKey[:]),
+			CommonName: fmt.Sprintf("derpkey%x", s.publicKey.UntypedHexString()),
 		},
 		// Windows requires NotAfter and NotBefore set:
 		NotAfter:  time.Now().Add(30 * 24 * time.Hour),
@@ -515,7 +514,7 @@ func (s *Server) registerClient(c *sclient) {
 // presence changed.
 //
 // s.mu must be held.
-func (s *Server) broadcastPeerStateChangeLocked(peer key.Public, present bool) {
+func (s *Server) broadcastPeerStateChangeLocked(peer key.NodePublic, present bool) {
 	for w := range s.watchers {
 		w.peerStateChange = append(w.peerStateChange, peerConnState{peer: peer, present: present})
 		go w.requestMeshUpdate()
@@ -577,7 +576,7 @@ func (s *Server) unregisterClient(c *sclient) {
 // key has sent to previously (whether those sends were from a local
 // client or forwarded).  It must only be called after the key has
 // been removed from clientsMesh.
-func (s *Server) notePeerGoneFromRegionLocked(key key.Public) {
+func (s *Server) notePeerGoneFromRegionLocked(key key.NodePublic) {
 	if _, ok := s.clientsMesh[key]; ok {
 		panic("usage")
 	}
@@ -663,7 +662,7 @@ func (s *Server) accept(nc Conn, brw *bufio.ReadWriter, remoteAddr string, connN
 		connectedAt:    time.Now(),
 		sendQueue:      make(chan pkt, perClientSendQueueDepth),
 		discoSendQueue: make(chan pkt, perClientSendQueueDepth),
-		peerGone:       make(chan key.Public),
+		peerGone:       make(chan key.NodePublic),
 		canMesh:        clientInfo.MeshKey != "" && clientInfo.MeshKey == s.meshKey,
 	}
 
@@ -774,10 +773,11 @@ func (c *sclient) handleFrameClosePeer(ft frameType, fl uint32) error {
 	if !c.canMesh {
 		return fmt.Errorf("insufficient permissions")
 	}
-	var targetKey key.Public
-	if _, err := io.ReadFull(c.br, targetKey[:]); err != nil {
+	var bs [32]byte
+	if _, err := io.ReadFull(c.br, bs[:]); err != nil {
 		return err
 	}
+	targetKey := key.NodePublicFromRaw32(mem.B(bs[:]))
 	s := c.s
 
 	s.mu.Lock()
@@ -845,10 +845,10 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 // notePeerSendLocked records that src sent to dst.  We keep track of
 // that so when src disconnects, we can tell dst (if it's still
 // around) that src is gone (a peerGone frame).
-func (s *Server) notePeerSendLocked(src key.Public, dst *sclient) {
+func (s *Server) notePeerSendLocked(src key.NodePublic, dst *sclient) {
 	m, ok := s.sentTo[src]
 	if !ok {
-		m = map[key.Public]int64{}
+		m = map[key.NodePublic]int64{}
 		s.sentTo[src] = m
 	}
 	m[dst.key] = dst.connNum
@@ -919,7 +919,7 @@ const (
 	dropReasonDupClient                          // the public key is connected 2+ times (active/active, fighting)
 )
 
-func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.Public, reason dropReason) {
+func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.NodePublic, reason dropReason) {
 	s.packetsDropped.Add(1)
 	s.packetsDroppedReasonCounters[reason].Add(1)
 	if disco.LooksLikeDiscoWrapper(packetBytes) {
@@ -982,7 +982,7 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 // requestPeerGoneWrite sends a request to write a "peer gone" frame
 // that the provided peer has disconnected. It blocks until either the
 // write request is scheduled, or the client has closed.
-func (c *sclient) requestPeerGoneWrite(peer key.Public) {
+func (c *sclient) requestPeerGoneWrite(peer key.NodePublic) {
 	select {
 	case c.peerGone <- peer:
 	case <-c.done:
@@ -999,7 +999,7 @@ func (c *sclient) requestMeshUpdate() {
 	}
 }
 
-func (s *Server) verifyClient(clientKey key.Public, info *clientInfo) error {
+func (s *Server) verifyClient(clientKey key.NodePublic, info *clientInfo) error {
 	if !s.verifyClients {
 		return nil
 	}
@@ -1018,9 +1018,9 @@ func (s *Server) verifyClient(clientKey key.Public, info *clientInfo) error {
 }
 
 func (s *Server) sendServerKey(lw *lazyBufioWriter) error {
-	buf := make([]byte, 0, len(magic)+len(s.publicKey))
+	buf := make([]byte, 0, len(magic)+32)
 	buf = append(buf, magic...)
-	buf = append(buf, s.publicKey[:]...)
+	buf = s.publicKey.AppendTo(buf)
 	err := writeFrame(lw.bw(), frameServerKey, buf)
 	lw.Flush() // redundant (no-op) flush to release bufio.Writer
 	return err
@@ -1081,21 +1081,14 @@ type serverInfo struct {
 	Version int `json:"version,omitempty"`
 }
 
-func (s *Server) sendServerInfo(bw *lazyBufioWriter, clientKey key.Public) error {
-	var nonce [24]byte
-	if _, err := crand.Read(nonce[:]); err != nil {
-		return err
-	}
+func (s *Server) sendServerInfo(bw *lazyBufioWriter, clientKey key.NodePublic) error {
 	msg, err := json.Marshal(serverInfo{Version: ProtocolVersion})
 	if err != nil {
 		return err
 	}
 
-	msgbox := box.Seal(nil, msg, &nonce, clientKey.B32(), s.privateKey.B32())
+	msgbox := s.privateKey.SealTo(clientKey, msg)
 	if err := writeFrameHeader(bw.bw(), frameServerInfo, nonceLen+uint32(len(msgbox))); err != nil {
-		return err
-	}
-	if _, err := bw.Write(nonce[:]); err != nil {
 		return err
 	}
 	if _, err := bw.Write(msgbox); err != nil {
@@ -1107,7 +1100,7 @@ func (s *Server) sendServerInfo(bw *lazyBufioWriter, clientKey key.Public) error
 // recvClientKey reads the frameClientInfo frame from the client (its
 // proof of identity) upon its initial connection. It should be
 // considered especially untrusted at this point.
-func (s *Server) recvClientKey(br *bufio.Reader) (clientKey key.Public, info *clientInfo, err error) {
+func (s *Server) recvClientKey(br *bufio.Reader) (clientKey key.NodePublic, info *clientInfo, err error) {
 	fl, err := readFrameTypeHeader(br, frameClientInfo)
 	if err != nil {
 		return zpub, nil, err
@@ -1121,21 +1114,19 @@ func (s *Server) recvClientKey(br *bufio.Reader) (clientKey key.Public, info *cl
 	if fl > 256<<10 {
 		return zpub, nil, errors.New("long client info")
 	}
-	if _, err := io.ReadFull(br, clientKey[:]); err != nil {
+	var bs [32]byte
+	if _, err := io.ReadFull(br, bs[:]); err != nil {
 		return zpub, nil, err
 	}
-	var nonce [24]byte
-	if _, err := io.ReadFull(br, nonce[:]); err != nil {
-		return zpub, nil, fmt.Errorf("nonce: %v", err)
-	}
-	msgLen := int(fl - minLen)
+	clientKey = key.NodePublicFromRaw32(mem.B(bs[:]))
+	msgLen := int(fl - keyLen)
 	msgbox := make([]byte, msgLen)
 	if _, err := io.ReadFull(br, msgbox); err != nil {
 		return zpub, nil, fmt.Errorf("msgbox: %v", err)
 	}
-	msg, ok := box.Open(nil, msgbox, &nonce, (*[32]byte)(&clientKey), s.privateKey.B32())
+	msg, ok := s.privateKey.OpenFrom(clientKey, msgbox)
 	if !ok {
-		return zpub, nil, fmt.Errorf("msgbox: cannot open len=%d with client key %x", msgLen, clientKey[:])
+		return zpub, nil, fmt.Errorf("msgbox: cannot open len=%d with client key %x", msgLen, clientKey.UntypedHexString())
 	}
 	info = new(clientInfo)
 	if err := json.Unmarshal(msg, info); err != nil {
@@ -1144,7 +1135,7 @@ func (s *Server) recvClientKey(br *bufio.Reader) (clientKey key.Public, info *cl
 	return clientKey, info, nil
 }
 
-func (s *Server) recvPacket(br *bufio.Reader, frameLen uint32) (dstKey key.Public, contents []byte, err error) {
+func (s *Server) recvPacket(br *bufio.Reader, frameLen uint32) (dstKey key.NodePublic, contents []byte, err error) {
 	if frameLen < keyLen {
 		return zpub, nil, errors.New("short send packet frame")
 	}
@@ -1169,17 +1160,17 @@ func (s *Server) recvPacket(br *bufio.Reader, frameLen uint32) (dstKey key.Publi
 	return dstKey, contents, nil
 }
 
-// zpub is the key.Public zero value.
-var zpub key.Public
+// zpub is the key.NodePublic zero value.
+var zpub key.NodePublic
 
-func (s *Server) recvForwardPacket(br *bufio.Reader, frameLen uint32) (srcKey, dstKey key.Public, contents []byte, err error) {
+func (s *Server) recvForwardPacket(br *bufio.Reader, frameLen uint32) (srcKey, dstKey key.NodePublic, contents []byte, err error) {
 	if frameLen < keyLen*2 {
 		return zpub, zpub, nil, errors.New("short send packet frame")
 	}
-	if _, err := io.ReadFull(br, srcKey[:]); err != nil {
+	if _, err := srcKey.ReadFrom(br); err != nil {
 		return zpub, zpub, nil, err
 	}
-	if _, err := io.ReadFull(br, dstKey[:]); err != nil {
+	if _, err := dstKey.ReadFrom(br); err != nil {
 		return zpub, zpub, nil, err
 	}
 	packetLen := frameLen - keyLen*2
@@ -1203,19 +1194,19 @@ type sclient struct {
 	connNum        int64 // process-wide unique counter, incremented each Accept
 	s              *Server
 	nc             Conn
-	key            key.Public
+	key            key.NodePublic
 	info           clientInfo
 	logf           logger.Logf
-	done           <-chan struct{}  // closed when connection closes
-	remoteAddr     string           // usually ip:port from net.Conn.RemoteAddr().String()
-	remoteIPPort   netaddr.IPPort   // zero if remoteAddr is not ip:port.
-	sendQueue      chan pkt         // packets queued to this client; never closed
-	discoSendQueue chan pkt         // important packets queued to this client; never closed
-	peerGone       chan key.Public  // write request that a previous sender has disconnected (not used by mesh peers)
-	meshUpdate     chan struct{}    // write request to write peerStateChange
-	canMesh        bool             // clientInfo had correct mesh token for inter-region routing
-	isDup          syncs.AtomicBool // whether more than 1 sclient for key is connected
-	isDisabled     syncs.AtomicBool // whether sends to this peer are disabled due to active/active dups
+	done           <-chan struct{}     // closed when connection closes
+	remoteAddr     string              // usually ip:port from net.Conn.RemoteAddr().String()
+	remoteIPPort   netaddr.IPPort      // zero if remoteAddr is not ip:port.
+	sendQueue      chan pkt            // packets queued to this client; never closed
+	discoSendQueue chan pkt            // important packets queued to this client; never closed
+	peerGone       chan key.NodePublic // write request that a previous sender has disconnected (not used by mesh peers)
+	meshUpdate     chan struct{}       // write request to write peerStateChange
+	canMesh        bool                // clientInfo had correct mesh token for inter-region routing
+	isDup          syncs.AtomicBool    // whether more than 1 sclient for key is connected
+	isDisabled     syncs.AtomicBool    // whether sends to this peer are disabled due to active/active dups
 
 	// replaceLimiter controls how quickly two connections with
 	// the same client key can kick each other off the server by
@@ -1242,14 +1233,14 @@ type sclient struct {
 // peerConnState represents whether a peer is connected to the server
 // or not.
 type peerConnState struct {
-	peer    key.Public
+	peer    key.NodePublic
 	present bool
 }
 
 // pkt is a request to write a data frame to an sclient.
 type pkt struct {
 	// src is the who's the sender of the packet.
-	src key.Public
+	src key.NodePublic
 
 	// enqueuedAt is when a packet was put onto a queue before it was sent,
 	// and is used for reporting metrics on the duration of packets in the queue.
@@ -1394,23 +1385,23 @@ func (c *sclient) sendKeepAlive() error {
 }
 
 // sendPeerGone sends a peerGone frame, without flushing.
-func (c *sclient) sendPeerGone(peer key.Public) error {
+func (c *sclient) sendPeerGone(peer key.NodePublic) error {
 	c.s.peerGoneFrames.Add(1)
 	c.setWriteDeadline()
 	if err := writeFrameHeader(c.bw.bw(), framePeerGone, keyLen); err != nil {
 		return err
 	}
-	_, err := c.bw.Write(peer[:])
+	_, err := peer.WriteTo(c.bw)
 	return err
 }
 
 // sendPeerPresent sends a peerPresent frame, without flushing.
-func (c *sclient) sendPeerPresent(peer key.Public) error {
+func (c *sclient) sendPeerPresent(peer key.NodePublic) error {
 	c.setWriteDeadline()
 	if err := writeFrameHeader(c.bw.bw(), framePeerPresent, keyLen); err != nil {
 		return err
 	}
-	_, err := c.bw.Write(peer[:])
+	_, err := peer.WriteTo(c.bw)
 	return err
 }
 
@@ -1462,7 +1453,7 @@ func (c *sclient) sendMeshUpdates() error {
 // DERPv2. The bytes of contents are only valid until this function
 // returns, do not retain slices.
 // It does not flush its bufio.Writer.
-func (c *sclient) sendPacket(srcKey key.Public, contents []byte) (err error) {
+func (c *sclient) sendPacket(srcKey key.NodePublic, contents []byte) (err error) {
 	defer func() {
 		// Stats update.
 		if err != nil {
@@ -1478,7 +1469,7 @@ func (c *sclient) sendPacket(srcKey key.Public, contents []byte) (err error) {
 	withKey := !srcKey.IsZero()
 	pktLen := len(contents)
 	if withKey {
-		pktLen += len(srcKey)
+		pktLen += 32
 	}
 	if err = writeFrameHeader(c.bw.bw(), frameRecvPacket, uint32(pktLen)); err != nil {
 		return err
@@ -1495,7 +1486,7 @@ func (c *sclient) sendPacket(srcKey key.Public, contents []byte) (err error) {
 
 // AddPacketForwarder registers fwd as a packet forwarder for dst.
 // fwd must be comparable.
-func (s *Server) AddPacketForwarder(dst key.Public, fwd PacketForwarder) {
+func (s *Server) AddPacketForwarder(dst key.NodePublic, fwd PacketForwarder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if prev, ok := s.clientsMesh[dst]; ok {
@@ -1527,7 +1518,7 @@ func (s *Server) AddPacketForwarder(dst key.Public, fwd PacketForwarder) {
 
 // RemovePacketForwarder removes fwd as a packet forwarder for dst.
 // fwd must be comparable.
-func (s *Server) RemovePacketForwarder(dst key.Public, fwd PacketForwarder) {
+func (s *Server) RemovePacketForwarder(dst key.NodePublic, fwd PacketForwarder) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v, ok := s.clientsMesh[dst]
@@ -1589,7 +1580,7 @@ func (m multiForwarder) maxVal() (max uint8) {
 	return
 }
 
-func (m multiForwarder) ForwardPacket(src, dst key.Public, payload []byte) error {
+func (m multiForwarder) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
 	var fwd PacketForwarder
 	var lowest uint8
 	for k, v := range m {
@@ -1693,31 +1684,18 @@ func (s *Server) ConsistencyCheck() error {
 // It is ~4x slower than io.ReadFull(br, key),
 // but it prevents key from escaping and thus being allocated.
 // If io.ReadFull(br, key) does not cause key to escape, use that instead.
-func readPublicKey(br *bufio.Reader, key *key.Public) error {
-	// Do io.ReadFull(br, key), but one byte at a time, to avoid allocation.
-	for i := range key {
-		b, err := br.ReadByte()
-		if err != nil {
-			return err
-		}
-		key[i] = b
-	}
-	return nil
+func readPublicKey(br *bufio.Reader, key *key.NodePublic) error {
+	_, err := key.ReadFrom(br)
+	return err
 }
 
 // writePublicKey writes key to bw.
 // It is ~3x slower than bw.Write(key[:]),
 // but it prevents key from escaping and thus being allocated.
 // If bw.Write(key[:]) does not cause key to escape, use that instead.
-func writePublicKey(bw *bufio.Writer, key *key.Public) error {
-	// Do bw.Write(key[:]), but one byte at a time to avoid allocation.
-	for _, b := range key {
-		err := bw.WriteByte(b)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+func writePublicKey(bw *bufio.Writer, key *key.NodePublic) error {
+	_, err := key.WriteTo(bw)
+	return err
 }
 
 const minTimeBetweenLogs = 2 * time.Second
@@ -1728,7 +1706,7 @@ type BytesSentRecv struct {
 	Sent uint64
 	Recv uint64
 	// Key is the public key of the client which sent/received these bytes.
-	Key key.Public
+	Key key.NodePublic
 }
 
 // parseSSOutput parses the output from the specific call to ss in ServeDebugTraffic.

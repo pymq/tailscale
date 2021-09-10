@@ -9,7 +9,7 @@ package wgcfg
 import (
 	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/types/key"
 )
 
 // Clone makes a deep copy of Config.
@@ -33,7 +33,7 @@ func (src *Config) Clone() *Config {
 //   tailscale.com/cmd/cloner -type Config,Peer
 var _ConfigNeedsRegeneration = Config(struct {
 	Name       string
-	PrivateKey wgkey.Private
+	PrivateKey key.NodePrivate
 	Addresses  []netaddr.IPPrefix
 	MTU        uint16
 	DNS        []netaddr.IP
@@ -55,7 +55,7 @@ func (src *Peer) Clone() *Peer {
 // A compilation failure here means this code must be regenerated, with command:
 //   tailscale.com/cmd/cloner -type Config,Peer
 var _PeerNeedsRegeneration = Peer(struct {
-	PublicKey           wgkey.Key
+	PublicKey           key.NodePublic
 	DiscoKey            tailcfg.DiscoKey
 	AllowedIPs          []netaddr.IPPrefix
 	PersistentKeepalive uint16

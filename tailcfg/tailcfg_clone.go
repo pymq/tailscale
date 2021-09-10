@@ -72,7 +72,7 @@ var _NodeNeedsRegeneration = Node(struct {
 	Name                    string
 	User                    UserID
 	Sharer                  UserID
-	Key                     NodeKey
+	Key                     key.NodePublic
 	KeyExpiry               time.Time
 	Machine                 key.MachinePublic
 	DiscoKey                DiscoKey

@@ -32,7 +32,6 @@ import (
 	"tailscale.com/net/stun"
 	"tailscale.com/tsweb"
 	"tailscale.com/types/key"
-	"tailscale.com/types/wgkey"
 )
 
 var (
@@ -50,12 +49,12 @@ var (
 )
 
 type config struct {
-	PrivateKey wgkey.Private
+	PrivateKey key.NodePrivate
 }
 
 func loadConfig() config {
 	if *dev {
-		return config{PrivateKey: mustNewKey()}
+		return config{PrivateKey: key.NewNode()}
 	}
 	if *configPath == "" {
 		if os.Getuid() == 0 {
@@ -81,16 +80,8 @@ func loadConfig() config {
 	}
 }
 
-func mustNewKey() wgkey.Private {
-	key, err := wgkey.NewPrivate()
-	if err != nil {
-		log.Fatal(err)
-	}
-	return key
-}
-
 func writeNewConfig() config {
-	key := mustNewKey()
+	key := key.NewNode()
 	if err := os.MkdirAll(filepath.Dir(*configPath), 0777); err != nil {
 		log.Fatal(err)
 	}
@@ -132,7 +123,7 @@ func main() {
 
 	letsEncrypt := tsweb.IsProd443(*addr)
 
-	s := derp.NewServer(key.Private(cfg.PrivateKey), log.Printf)
+	s := derp.NewServer(cfg.PrivateKey, log.Printf)
 	s.SetVerifyClient(*verifyClients)
 
 	if *meshPSKFile != "" {
