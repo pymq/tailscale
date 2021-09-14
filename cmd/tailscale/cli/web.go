@@ -7,6 +7,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"encoding/json"
 	"encoding/xml"
@@ -19,6 +20,7 @@ import (
 	"net/http"
 	"net/http/cgi"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -83,6 +85,35 @@ var webArgs struct {
 	cgi    bool
 }
 
+func tlsCertFromEnvironment(listen string) (*http.Server, error) {
+	crt := os.Getenv("TLS_CRT")
+	key := os.Getenv("TLS_KEY")
+	if crt != "" && key != "" {
+		fmt.Println(crt)
+		// We support passing in the complete certificate and key from environment
+		// variables because pfSense stores its cert+key in the PHP config. We populate
+		// TLS_CRT and TLS_KEY from PHP code before starting tailscale web.
+		cert, err := tls.X509KeyPair([]byte(crt), []byte(key))
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+
+		// Build a server:
+		server := &http.Server{
+			Addr:      listen,
+			TLSConfig: tlsConfig,
+		}
+
+		return server, nil
+	}
+
+	return nil, nil
+}
+
 func runWeb(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		log.Fatalf("too many non-flag arguments: %q", args)
@@ -96,8 +127,14 @@ func runWeb(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	log.Printf("web server running on: %s", urlOfListenAddr(webArgs.listen))
-	return http.ListenAndServe(webArgs.listen, http.HandlerFunc(webHandler))
+	server, err := tlsCertFromEnvironment(webArgs.listen)
+	if server != nil && err == nil {
+		log.Printf("web server running on: https://%s", server.Addr)
+		return server.ListenAndServeTLS("", "")
+	} else {
+		log.Printf("web server running on: %s", urlOfListenAddr(webArgs.listen))
+		return http.ListenAndServe(webArgs.listen, http.HandlerFunc(webHandler))
+	}
 }
 
 // urlOfListenAddr parses a given listen address into a formatted URL
