@@ -55,7 +55,20 @@ func DefaultTailscaledStateFile() string {
 		return f()
 	}
 	if runtime.GOOS == "windows" {
-		return filepath.Join(os.Getenv("LocalAppData"), "Tailscale", "server-state.conf")
+		programData := filepath.Join(os.Getenv("ProgramData"), "Tailscale", "server-state.conf")
+		if _, err := os.Stat(programData); err == nil {
+			return programData
+		}
+
+		// This is where Tailscale 1.14 and earlier stored the server-state. (Issue 2856)
+		// We still recognize it as a fallback.
+		localAppData := filepath.Join(os.Getenv("LocalAppData"), "Tailscale", "server-state.conf")
+		if _, err := os.Stat(localAppData); err == nil {
+			return localAppData
+		}
+
+		// Neither already exists, so use ProgramData.
+		return programData
 	}
 	return ""
 }

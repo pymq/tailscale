@@ -33,6 +33,7 @@ import (
 	_ "net/url"
 	_ "os"
 	_ "os/signal"
+	_ "path/filepath"
 	_ "runtime"
 	_ "runtime/debug"
 	_ "strconv"

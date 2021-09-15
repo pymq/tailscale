@@ -20,6 +20,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -96,6 +97,60 @@ var subCommands = map[string]*func([]string) error{
 	"debug":                   &debugModeFunc,
 }
 
+// tryWindowsAppDataMigration attempts to move the Windows state storage
+// directory from its old location to the new location. (Issue 2856)
+//
+// Tailscale 1.14 and before stored state under %LocalAppData%
+// (usually "C:\WINDOWS\system32\config\systemprofile\AppData\Local"
+// when tailscaled.exe is running as a non-user system service).
+// However it is frequently cleared for almost any reason: Windows
+// updates, System Restore, even various System Cleaner utilities.
+//
+// This function does not return an error; on rename failure, code elsewhere
+// in Tailscale will continue to use the old location as a fallback.
+func tryWindowsAppDataMigration() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	oldDir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+	_, err := os.Stat(oldDir)
+	if os.IsNotExist(err) {
+		// Common case.
+		return
+	}
+	if err != nil {
+		log.Printf("tryWindowsAppDataMigration failed; AppDataLocal: %v", err)
+		return
+	}
+
+	programData := filepath.Join(os.Getenv("ProgramData"), "Tailscale")
+	_, err = os.Stat(programData)
+	if err == nil {
+		// Both AppData\Local\Tailscale and ProgramData\Tailscale exist. There are
+		// cases where this can happen, like if one downgrades from a version which
+		// stores state in ProgramData back to an earlier version that re-creates
+		// state in AppData\Local.
+		// This is unusual so we log it, but don't otherwise mess with the files.
+		log.Printf("tryWindowsAppDataMigration: ProgramData and AppDataLocal both exist")
+		return
+	}
+	if !os.IsNotExist(err) {
+		log.Printf("tryWindowsAppDataMigration failed; new dir: %v", err)
+		return
+	}
+
+	// Atomically move AppData\Local\Tailscale to ProgramData\Tailscale
+	err = os.Rename(oldDir, programData)
+	if err != nil {
+		log.Printf("tryWindowsAppDataMigration: %v", err)
+		return
+	}
+
+	log.Printf("tryWindowsAppDataMigration: successfully migrated: from %v to %v",
+		oldDir, programData)
+}
+
 func main() {
 	// We aren't very performance sensitive, and the parts that are
 	// performance sensitive (wireguard) try hard not to do any memory
@@ -139,6 +194,10 @@ func main() {
 	flag.Parse()
 	if flag.NArg() > 0 {
 		log.Fatalf("tailscaled does not take non-flag arguments: %q", flag.Args())
+	}
+
+	if args.statepath == paths.DefaultTailscaledStateFile() {
+		tryWindowsAppDataMigration()
 	}
 
 	if printVersion {
